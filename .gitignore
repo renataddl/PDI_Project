@@ -1,0 +1,7 @@
+# Ignorar arquivos TIFF
+*.tiff
+*.tif
+# opcional: ignorar caches e arquivos temporários
+__pycache__/
+*.pyc
+.DS_Store
