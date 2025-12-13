@@ -1,6 +1,7 @@
 # Ignorar arquivos TIFF
 *.tiff
 *.tif
+*.jpg
 # opcional: ignorar caches e arquivos temporários
 __pycache__/
 *.pyc

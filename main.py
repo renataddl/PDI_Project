@@ -1,208 +1,205 @@
-import cv2 
+import cv2
 import os
-import tkinter as tk
-from tkinter import filedialog
-import numpy as np
+import numpy as np 
+import matplotlib.pyplot as plt # Necessário instalar: pip install matplotlib
 
-def fft_enhance(gray, hp_radius=30, use_butterworth=False, order=2):
+# --- CONFIGURAÇÃO ---
+# Coloque o nome exato do seu arquivo aqui. 
+# Se estiver na mesma pasta do script, só o nome basta.
+ARQUIVO_ALVO = "101_3.tif" 
+
+def aplicar_fft(img, block_size=32, k=0.45):
+    img_float = img.astype(np.float32)
+    rows, cols = img.shape
+    pad_rows = (block_size - rows % block_size) % block_size
+    pad_cols = (block_size - cols % block_size) % block_size
+    padded_img = np.pad(img_float, ((0, pad_rows), (0, pad_cols)), mode='constant')
+    
+    enhanced_img = np.zeros_like(padded_img)
+    padded_rows, padded_cols = padded_img.shape
+    
+    for r in range(0, padded_rows, block_size):
+        for c in range(0, padded_cols, block_size):
+            block = padded_img[r:r+block_size, c:c+block_size]
+            f = np.fft.fft2(block)
+            fshift = np.fft.fftshift(f)
+            magnitude = np.abs(fshift)
+            enhanced_f = fshift * (magnitude ** k)
+            f_ishift = np.fft.ifftshift(enhanced_f)
+            img_back = np.fft.ifft2(f_ishift)
+            enhanced_img[r:r+block_size, c:c+block_size] = np.abs(img_back)
+
+    result = enhanced_img[:rows, :cols]
+    result = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX)
+    return result.astype(np.uint8)
+
+def aplicar_suavizacao(img):
     """
-    Aplica filtro passa-alta no domínio da frequência.
-    hp_radius: raio de corte em pixels (quanto maior, menos alto-frequência é removida).
-    use_butterworth: se True usa Butterworth HP, caso contrário usa máscara ideal.
-    order: ordem do filtro Butterworth.
-    Retorna imagem realçada (uint8).
+    Suavização aprimorada para remover artefatos de bloco da FFT.
     """
-    rows, cols = gray.shape
-    # DFT
-    dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
-    dft_shift = np.fft.fftshift(dft)
+    # 1. Filtro Gaussiano um pouco maior para conectar as cristas quebradas pelos blocos
+    # Aumentar o kernel de (5,5) para (7,7) ajuda a "fundir" as bordas dos blocos.
+    img_gauss = cv2.GaussianBlur(img, (7, 7), 1.0)
+    
+    # 2. Opcional: Filtro de Mediana para remover ruído "sal e pimenta" residual
+    # Isso limpa os pontinhos pretos/brancos que sobram dentro das cristas.
+    img_mediana = cv2.medianBlur(img_gauss, 3)
+    
+    return img_mediana
 
-    # construir máscara
-    crow, ccol = rows // 2, cols // 2
-    if use_butterworth:
-        u = np.arange(cols) - ccol
-        v = np.arange(rows) - crow
-        U, V = np.meshgrid(u, v)
-        D = np.sqrt(U**2 + V**2)
-        # Butterworth high-pass: H = 1 / (1 + (D0/D)^(2n))
-        H = 1.0 / (1.0 + (hp_radius / (D + 1e-8))**(2 * order))
-        mask = np.dstack([H, H]).astype(np.float32)
-    else:
-        mask = np.ones((rows, cols, 2), np.float32)
-        Y, X = np.ogrid[:rows, :cols]
-        mask_area = (Y - crow)**2 + (X - ccol)**2 <= (hp_radius**2)
-        mask[mask_area] = 0  # remove componentes de baixa frequência
+def binarizar_otsu_local(img, block_size=32):
+    rows, cols = img.shape
+    binaria = np.zeros_like(img)
+    for r in range(0, rows, block_size):
+        for c in range(0, cols, block_size):
+            r_end = min(r + block_size, rows)
+            c_end = min(c + block_size, cols)
+            block = img[r:r_end, c:c_end]
+            if block.size == 0: continue
+            thresh, bin_block = cv2.threshold(block, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            binaria[r:r_end, c:c_end] = bin_block
+    return binaria
 
-    # aplicar e voltar ao espaço imagem
-    fshift = dft_shift * mask
-    f_ishift = np.fft.ifftshift(fshift)
-    img_back = cv2.idft(f_ishift)
-    img_back = cv2.magnitude(img_back[:, :, 0], img_back[:, :, 1])
-    img_back = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return img_back
+def espalhamento_contraste_local(img, kernel_size=(5, 5)):
+    img_media = cv2.blur(img, kernel_size)
+    img_saida = img.copy()
+    mascara_fundo = img < img_media
+    img_saida[mascara_fundo] = 0
+    return img_saida
 
-def block_fft_enhance(gray, block_size=32, k=0.45, stride=None, post_smooth_sigma=1.0):
+def estimar_roi_variancia(img, block_size=16, threshold_std=10.0):
+    rows, cols = img.shape
+    mask = np.zeros_like(img)
+    for r in range(0, rows, block_size):
+        for c in range(0, cols, block_size):
+            r_end = min(r + block_size, rows)
+            c_end = min(c + block_size, cols)
+            block = img[r:r_end, c:c_end]
+            if block.size == 0: continue
+            if np.std(block) > threshold_std:
+                mask[r:r_end, c:c_end] = 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block_size*2, block_size*2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.erode(mask, kernel_erode, iterations=1)
+    return mask
+
+def estimar_imagem_direcional(img, roi_mask, block_size=16):
+    rows, cols = img.shape
+    vis_orientacao = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    
+    for r in range(0, rows, block_size):
+        for c in range(0, cols, block_size):
+            cx, cy = c + block_size // 2, r + block_size // 2
+            if cx < cols and cy < rows:
+                if roi_mask[cy, cx] == 0: continue
+
+            r_end = min(r + block_size, rows)
+            c_end = min(c + block_size, cols)
+            gxb = gx[r:r_end, c:c_end]
+            gyb = gy[r:r_end, c:c_end]
+            val_xy = 2 * np.sum(gxb * gyb)
+            val_xx_yy = np.sum(gxb**2 - gyb**2)
+            
+            if val_xx_yy == 0 and val_xy == 0: angle = 0
+            else: angle = 0.5 * np.arctan2(val_xy, val_xx_yy)
+            
+            length = block_size // 2 - 2
+            x2 = int(cx + length * np.cos(angle + np.pi/2))
+            y2 = int(cy + length * np.sin(angle + np.pi/2))
+            x1 = int(cx - length * np.cos(angle + np.pi/2))
+            y1 = int(cy - length * np.sin(angle + np.pi/2))
+            cv2.line(vis_orientacao, (x1, y1), (x2, y2), (0, 0, 255), 1)
+    return vis_orientacao
+
+def visualizar_resultados_plt(orig, limpa, fft, roi, binaria, direcional):
     """
-    Aprimora imagem em blocos seguindo Chikkerur:
-    - usa overlap-add (stride, por padrão 50% do bloco) para reduzir artefatos de blocos;
-    - normaliza a magnitude por bloco antes de aplicar mag**k;
-    - opcional suavização final (post_smooth_sigma > 0).
-    Retorna uint8 normalizado (0..255).
+    Exibe os resultados usando Matplotlib (Melhor para zoom e análise)
     """
-    rows, cols = gray.shape
-    bs = block_size
-    if stride is None:
-        stride = bs // 2  # overlap 50%
-    # pad para garantir cobertura com o stride
-    pad_r = (bs - (rows - bs) % stride - bs) % stride if rows > bs else (bs - rows)
-    pad_c = (bs - (cols - bs) % stride - bs) % stride if cols > bs else (bs - cols)
-    if pad_r == 0 and rows < bs:
-        pad_r = bs - rows
-    if pad_c == 0 and cols < bs:
-        pad_c = bs - cols
-    gray_p = np.pad(gray.astype(np.float32), ((0, pad_r), (0, pad_c)), mode='reflect')
-    r_p, c_p = gray_p.shape
+    plt.figure(figsize=(12, 8))
+    
+    titulos = ["1. Original Invertida", "2. Limpa (Hong et al.)", "3. FFT + Suavizada", 
+               "4. Máscara ROI", "5. Binária Final", "6. Direção"]
+    imagens = [orig, limpa, fft, roi, binaria, cv2.cvtColor(direcional, cv2.COLOR_BGR2RGB)]
+    
+    for i in range(6):
+        plt.subplot(2, 3, i+1)
+        plt.imshow(imagens[i], cmap='gray' if i < 5 else None)
+        plt.title(titulos[i])
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
 
-    out = np.zeros_like(gray_p, dtype=np.float32)
-    weight = np.zeros_like(gray_p, dtype=np.float32)
-    win1d = np.hanning(bs)
-    window = np.outer(win1d, win1d).astype(np.float32)
-    eps = 1e-8
-
-    # percorre com overlap
-    i = 0
-    while i <= r_p - bs:
-        j = 0
-        while j <= c_p - bs:
-            block = gray_p[i:i+bs, j:j+bs].astype(np.float32)
-            F = np.fft.fft2(block)
-            mag = np.abs(F)
-            # normalizar magnitude por bloco para evitar diferenças extremas
-            mag_norm = mag / (np.mean(mag) + eps)
-            gain = (mag_norm + eps) ** k
-            Fp = F * gain
-            recon = np.real(np.fft.ifft2(Fp))
-            out[i:i+bs, j:j+bs] += recon * window
-            weight[i:i+bs, j:j+bs] += window
-            j += stride
-        # garantir cobertura da borda direita
-        if j < c_p:
-            j = c_p - bs
-            block = gray_p[i:i+bs, j:j+bs].astype(np.float32)
-            F = np.fft.fft2(block)
-            mag = np.abs(F)
-            mag_norm = mag / (np.mean(mag) + eps)
-            gain = (mag_norm + eps) ** k
-            recon = np.real(np.fft.ifft2(F * gain))
-            out[i:i+bs, j:j+bs] += recon * window
-            weight[i:i+bs, j:j+bs] += window
-        i += stride
-
-    # garantir cobertura da borda inferior
-    if i < r_p:
-        i = r_p - bs
-        j = 0
-        while j <= c_p - bs:
-            block = gray_p[i:i+bs, j:j+bs].astype(np.float32)
-            F = np.fft.fft2(block)
-            mag = np.abs(F)
-            mag_norm = mag / (np.mean(mag) + eps)
-            gain = (mag_norm + eps) ** k
-            recon = np.real(np.fft.ifft2(F * gain))
-            out[i:i+bs, j:j+bs] += recon * window
-            weight[i:i+bs, j:j+bs] += window
-            j += stride
-        if j < c_p:
-            j = c_p - bs
-            block = gray_p[i:i+bs, j:j+bs].astype(np.float32)
-            F = np.fft.fft2(block)
-            mag = np.abs(F)
-            mag_norm = mag / (np.mean(mag) + eps)
-            gain = (mag_norm + eps) ** k
-            recon = np.real(np.fft.ifft2(F * gain))
-            out[i:i+bs, j:j+bs] += recon * window
-            weight[i:i+bs, j:j+bs] += window
-
-    out = out / (weight + eps)
-    out = out[:rows, :cols]
-    out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    return out
-
-def select_image(start_dir=None):
-    root = tk.Tk()
-    root.withdraw()
-    start = start_dir or os.path.expanduser("~")
-    path = filedialog.askopenfilename(title="Escolha uma imagem",
-                                       initialdir=start,
-                                       filetypes=[("Imagens","*.tif *.png *.jpg *.jpeg *.bmp"), ("Todos os arquivos","*.*")])
-    root.destroy()
-    return path
-
-def equalizar(path, save_output=True, use_fft=False, use_block_fft=False, hp_radius=30, use_butterworth=False, block_size=32, k=0.45):
-    img = cv2.imread(path)
-    if img is None:
-        raise ValueError("Erro ao carregar a imagem" + str(path))
-    escala_cinza = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    equalizada = cv2.equalizeHist(escala_cinza)
-
-    global_fft = None
-    block_fft = None
-    if use_fft:
-        # calcula FFT global sempre (opcional) e também o aprimoramento por blocos se pedido
-        global_fft = fft_enhance(equalizada, hp_radius=hp_radius, use_butterworth=use_butterworth, order=2)
-        if use_block_fft:
-            block_fft = block_fft_enhance(equalizada, block_size=block_size, k=k)
-
-    # criar 4 janelas e mostrar (usar janela vazia se não houver resultado)
-    h, w = escala_cinza.shape
-    gap = 10
-    cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Equalizada", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("FFT Block", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("FFT Global", cv2.WINDOW_NORMAL)
-
-    cv2.imshow("Original", escala_cinza)
-    cv2.imshow("Equalizada", equalizada)
-    cv2.imshow("FFT Block", block_fft if block_fft is not None else np.zeros_like(equalizada))
-    cv2.imshow("FFT Global", global_fft if global_fft is not None else np.zeros_like(equalizada))
-
-    # posicionar janelas em 2x2 para melhor visualização
+def aplicar_afinamento(img_binaria):
+    """
+    Aplica o algoritmo de Zhang-Suen para reduzir as cristas a 1 pixel de largura.
+    Requer: pip install opencv-contrib-python
+    """
+    # Verifica se a imagem está no formato correto (0 e 255)
+    # Zhang-Suen espera cristas BRANCAS (255) e fundo PRETO (0)
+    
     try:
-        cv2.moveWindow("Original", 0, 0)
-        cv2.moveWindow("Equalizada", w + gap, 0)
-        cv2.moveWindow("FFT Block", 0, h + gap)
-        cv2.moveWindow("FFT Global", w + gap, h + gap)
-    except Exception:
-        # alguns backends podem ignorar moveWindow; não é crítico
-        pass
+        # O OpenCV tem o Zhang-Suen nativo no módulo ximgproc
+        # THINNING_ZHANGSUEN = 0
+        skeleton = cv2.ximgproc.thinning(img_binaria, thinningType=0)
+        return skeleton
+    except AttributeError:
+        print("\n[ERRO] O módulo 'cv2.ximgproc' não foi encontrado.")
+        print("Para usar o Zhang-Suen, instale a versão contrib do OpenCV:")
+        print("   pip uninstall opencv-python")
+        print("   pip install opencv-contrib-python\n")
+        return img_binaria # Retorna sem afinar para não travar    
 
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+def processar_imagem(path):
+    print(f"Lendo imagem: {path}")
+    img_bgr = cv2.imread(path)
+    if img_bgr is None: 
+        print("ERRO: Imagem não encontrada.")
+        return
 
-    # salvar resultados separados se solicitado
-    if save_output:
-        base, ext = os.path.splitext(os.path.basename(path))
-        out_dir = os.path.dirname(path)
-        cv2.imwrite(os.path.join(out_dir, f"{base}_original{ext}"), escala_cinza)
-        cv2.imwrite(os.path.join(out_dir, f"{base}_equalizada{ext}"), equalizada)
-        if block_fft is not None:
-            cv2.imwrite(os.path.join(out_dir, f"{base}_fft_block{ext}"), block_fft)
-            print(f"Salvo: {base}_fft_block{ext}")
-        if global_fft is not None:
-            cv2.imwrite(os.path.join(out_dir, f"{base}_fft_global{ext}"), global_fft)
-            print(f"Salvo: {base}_fft_global{ext}")
-        print(f"Salvo: {base}_equalizada{ext}")
+    # --- PIPELINE ---
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Inversão para garantir Fundo Preto / Crista Branca
+    if np.mean(img_gray) > 127:
+        print(" > Invertendo cores...")
+        img_gray = 255 - img_gray
 
-    # retorna o resultado principal (prioriza block_fft quando presente)
-    if use_fft:
-        return block_fft if block_fft is not None else global_fft
-    return equalizada
+    img_eq = cv2.equalizeHist(img_gray)
+    img_limpa = espalhamento_contraste_local(img_eq)
+    img_fft = aplicar_fft(img_limpa, k=0.45)
+    img_suave = aplicar_suavizacao(img_fft)
+    
+    print(" > Calculando ROI e Binarização...")
+    roi_mask = estimar_roi_variancia(img_suave, threshold_std=5.0)
+    img_bin = binarizar_otsu_local(img_suave)
+    
+    # Aplica ROI na Binária
+    img_bin_roi = cv2.bitwise_and(img_bin, img_bin, mask=roi_mask)
+
+    # --- NOVO PASSO: AFINAMENTO ---
+    print(" > Aplicando Afinamento (Zhang-Suen)...")
+    img_esqueleto = aplicar_afinamento(img_bin_roi)
+
+    # Direção (apenas visualização)
+    vis_dir = estimar_imagem_direcional(img_suave, roi_mask)
+
+    # --- VISUALIZAÇÃO ---
+    visualizar_resultados_plt(img_gray, img_fft, roi_mask, img_bin_roi, img_esqueleto, vis_dir)
 
 if __name__ == "__main__":
-    diretorio = r"C:\Users\Renata\Documents\Faculdade\pdi\Trabalho Final\DB1_B"
-    path_imagem = select_image(start_dir=diretorio)
-    if path_imagem:
-        equalizar(path_imagem, use_fft=True, use_block_fft=True, block_size=32, k=0.45)
+    # Verifica se o arquivo existe no diretório atual
+    if os.path.exists(ARQUIVO_ALVO):
+        processar_imagem(ARQUIVO_ALVO)
     else:
-        print("Nenhuma imagem selecionada.")
+        # Se não achar o arquivo fixo, tenta abrir o seletor ou avisa
+        print(f"Arquivo '{ARQUIVO_ALVO}' não encontrado na pasta do script.")
+        # Se quiser fallback para seletor, descomente as linhas abaixo:
+        # root = tk.Tk(); root.withdraw()
+        # path = filedialog.askopenfilename()
+        # if path: processar_imagem(path)
