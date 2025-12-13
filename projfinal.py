@@ -2,7 +2,6 @@ import cv2
 import os
 import numpy as np 
 import matplotlib.pyplot as plt 
-import math
 
 # --- CONFIGURAÇÃO ---
 ARQUIVO_ALVO = "101_3.tif" 
@@ -61,48 +60,31 @@ def espalhamento_contraste_local(img, kernel_size=(5, 5)):
     img_saida[mascara_fundo] = 0
     return img_saida
 
-def estimar_roi_variancia(img, block_size=16, threshold_std=5.0):
-    """
-    Estima ROI.
-    - threshold_std: Baixado para 5.0 para pegar até as cristas mais fracas.
-    - Erosão: Reduzida para evitar comer pedaços úteis do dedo.
-    """
+def estimar_roi_variancia(img, block_size=16, threshold_std=20.0):
     rows, cols = img.shape
     mask = np.zeros_like(img)
     img_float = img.astype(np.float32)
     
-    # 1. Variância (Sensibilidade aumentada)
     for r in range(0, rows, block_size):
         for c in range(0, cols, block_size):
             r_end = min(r + block_size, rows)
             c_end = min(c + block_size, cols)
             block = img_float[r:r_end, c:c_end]
             if block.size == 0: continue
-            
-            # Se a variância for maior que 5 (antes era 20), considera digital
             if np.std(block) > threshold_std:
                 mask[r:r_end, c:c_end] = 255
 
-    # 2. Limpeza Morfológica
-    # Fechamento FORTE para garantir que o centro do dedo fique sólido (sem buracos)
     kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block_size*2, block_size*2))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
-    
-    # Abertura para remover ruído isolado do fundo
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_large)
     
-    # 3. Erosão SUAVE (O segredo para não cortar demais)
-    # Reduzi iterations de 4 para 1 ou 2. Isso mantém a borda real do dedo.
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.erode(mask, kernel_small, iterations=1)
-    
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.erode(mask, kernel_small, iterations=4)
     return mask
 
 def estimar_imagem_direcional(img, roi_mask, block_size=16):
     rows, cols = img.shape
-    orientations = np.zeros((rows, cols), dtype=np.float32) # Matriz de angulos
     vis_orientacao = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    
     gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
     
@@ -122,19 +104,13 @@ def estimar_imagem_direcional(img, roi_mask, block_size=16):
             if val_xx_yy == 0 and val_xy == 0: angle = 0
             else: angle = 0.5 * np.arctan2(val_xy, val_xx_yy)
             
-            # SALVA O ANGULO NO BLOCO
-            orientations[r:r_end, c:c_end] = angle
-            
-            # Desenho (Visualização)
             length = block_size // 2 - 2
             x2 = int(cx + length * np.cos(angle + np.pi/2))
             y2 = int(cy + length * np.sin(angle + np.pi/2))
             x1 = int(cx - length * np.cos(angle + np.pi/2))
             y1 = int(cy - length * np.sin(angle + np.pi/2))
             cv2.line(vis_orientacao, (x1, y1), (x2, y2), (0, 0, 255), 1)
-            
-    # RETORNA AMBOS: A MATRIZ MATEMÁTICA E A IMAGEM VISUAL
-    return orientations, vis_orientacao
+    return vis_orientacao
 
 def aplicar_afinamento(img_binaria):
     _, img_thresh = cv2.threshold(img_binaria, 127, 255, cv2.THRESH_BINARY)
@@ -255,154 +231,6 @@ def extrair_minucias(skeleton_image, roi_mask, margin=10):
 
     return minutiae_map
 
-def get_minutiae_list(skeleton, roi_mask, margin=30):
-    """
-    Extrai lista bruta de minúcias.
-    margin: Ignora minúcias a 'margin' pixels das bordas da IMAGEM e da ROI.
-    """
-    minutiae = []
-    rows, cols = skeleton.shape
-    
-    # 1. Zona Segura (Ignorar bordas da ROI - o dedo)
-    kernel_margin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin*2, margin*2))
-    zona_segura = cv2.erode(roi_mask, kernel_margin)
-    
-    # 2. Margem Rígida da Imagem (O "Crop sem Crop")
-    # Zera as bordas da zona segura para garantir que nada encoste no limite da imagem
-    # Isso evita as falsas terminações onde a imagem acaba.
-    zona_segura[0:margin, :] = 0          # Topo
-    zona_segura[rows-margin:, :] = 0      # Base
-    zona_segura[:, 0:margin] = 0          # Esquerda
-    zona_segura[:, cols-margin:] = 0      # Direita
-    
-    # Kernels Hit-Miss
-    bifurcation_kernels = [
-        np.array([[1, 0, 1], [0, 1, 0], [0, 1, 0]]), # T
-        np.array([[0, 1, 0], [1, 1, 0], [0, 0, 1]])  # Y
-    ]
-    termination_kernels = [
-        np.array([[0, 1, 0], [0, 1, 0], [0, 0, 0]]),
-        np.array([[1, 0, 0], [0, 1, 0], [0, 0, 0]])
-    ]
-    
-    # Busca Bifurcações
-    for k_base in bifurcation_kernels:
-        k_curr = k_base
-        for _ in range(4):
-            k_curr = np.rot90(k_curr)
-            k = np.where(k_curr == 0, -1, k_curr).astype(int)
-            matches = cv2.morphologyEx(skeleton, cv2.MORPH_HITMISS, k)
-            # AQUI: Filtra pela zona segura (ROI + Bordas da Imagem)
-            matches = cv2.bitwise_and(matches, matches, mask=zona_segura)
-            coords = np.argwhere(matches == 255)
-            for y, x in coords:
-                minutiae.append({'x': int(x), 'y': int(y), 'type': 2, 'valid': True})
-
-    # Busca Terminações
-    for k_base in termination_kernels:
-        k_curr = k_base
-        for _ in range(4):
-            k_curr = np.rot90(k_curr)
-            k = np.where(k_curr == 0, -1, k_curr).astype(int)
-            matches = cv2.morphologyEx(skeleton, cv2.MORPH_HITMISS, k)
-            # AQUI: Filtra pela zona segura (ROI + Bordas da Imagem)
-            matches = cv2.bitwise_and(matches, matches, mask=zona_segura)
-            coords = np.argwhere(matches == 255)
-            for y, x in coords:
-                minutiae.append({'x': int(x), 'y': int(y), 'type': 1, 'valid': True})
-                
-    return minutiae
-
-def check_connectivity(skeleton, p1, p2, max_steps=15):
-    """BFS para verificar se p1 e p2 estão na mesma crista."""
-    start = (p1['y'], p1['x'])
-    end = (p2['y'], p2['x'])
-    
-    dist_euclid = np.sqrt((start[0]-end[0])**2 + (start[1]-end[1])**2)
-    if dist_euclid > max_steps: return False
-
-    queue = [(start, 0)]
-    visited = set(); visited.add(start)
-    rows, cols = skeleton.shape
-    
-    while queue:
-        (curr_y, curr_x), steps = queue.pop(0)
-        if (curr_y, curr_x) == end: return True
-        if steps >= max_steps: continue
-            
-        for dy in [-1, 0, 1]:
-            for dx in [-1, 0, 1]:
-                if dy == 0 and dx == 0: continue
-                ny, nx = curr_y + dy, curr_x + dx
-                if 0 <= ny < rows and 0 <= nx < cols:
-                    if skeleton[ny, nx] == 255 and (ny, nx) not in visited:
-                        visited.add((ny, nx))
-                        queue.append(((ny, nx), steps + 1))
-    return False
-
-def remove_false_minutiae(minutiae, skeleton, orientation_map, D=10):
-    """Aplica regras I-V do paper."""
-    num = len(minutiae)
-    # Regras de Pares
-    for i in range(num):
-        m1 = minutiae[i]
-        if not m1['valid']: continue
-        
-        for j in range(i + 1, num):
-            m2 = minutiae[j]
-            if not m2['valid']: continue
-            
-            dist = np.sqrt((m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2)
-            if dist > D: continue # Longe demais, ignora
-
-            # Regra I e III: Terminações próximas
-            if m1['type'] == 1 and m2['type'] == 1:
-                ang1 = orientation_map[m1['y'], m1['x']]
-                ang2 = orientation_map[m2['y'], m2['x']]
-                angle_diff = abs(ang1 - ang2)
-                # Se angulos similares ou opostos (ciclo de PI), remove
-                if angle_diff < np.deg2rad(20) or angle_diff > np.deg2rad(160):
-                    m1['valid'] = False; m2['valid'] = False
-                else:
-                    # Regra III (Ilhota): Remove de qualquer jeito se muito perto
-                    m1['valid'] = False; m2['valid'] = False
-
-            # Regra II: Duas Bifurcações na mesma crista
-            if m1['type'] == 2 and m2['type'] == 2:
-                if check_connectivity(skeleton, m1, m2, D+5):
-                    m1['valid'] = False; m2['valid'] = False
-            
-            # Regra IV: Bif + Term na mesma crista
-            if m1['type'] != m2['type']: 
-                if check_connectivity(skeleton, m1, m2, D+5):
-                    m1['valid'] = False; m2['valid'] = False
-    
-    # Regra V: Pontos Isolados
-    for i in range(num):
-        m1 = minutiae[i]
-        if not m1['valid']: continue
-        neighbors = 0
-        for j in range(num):
-            if i == j: continue
-            m2 = minutiae[j]
-            if not m2['valid']: continue
-            dist = np.sqrt((m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2)
-            if dist < D * 2.5: neighbors += 1
-        if neighbors == 0: m1['valid'] = False
-
-    return minutiae
-
-def draw_minutiae(img_rgb, minutiae_list):
-    vis = img_rgb.copy()
-    for m in minutiae_list:
-        if m['valid']:
-            color = (0, 255, 0) if m['type'] == 1 else (0, 0, 255) # Verde=Fim, Vermelho=Bif
-            cv2.circle(vis, (m['x'], m['y']), 4, color, 1)
-        else:
-            # Desenha removidas em azul pequeno (DEBUG)
-            cv2.circle(vis, (m['x'], m['y']), 2, (255, 0, 0), -1) 
-    return vis
-
 # ==========================================
 # VISUALIZAÇÃO E MAIN
 # ==========================================
@@ -450,7 +278,7 @@ def processar_imagem(path):
     
     # Binarização e ROI
     print(" > Binarizando e calculando ROI...")
-    roi_mask = estimar_roi_variancia(img_suave, threshold_std=5.0)
+    roi_mask = estimar_roi_variancia(img_suave, threshold_std=7.0)
     img_bin = binarizar_otsu_local(img_suave)
     img_bin_roi = cv2.bitwise_and(img_bin, img_bin, mask=roi_mask)
 
@@ -462,28 +290,18 @@ def processar_imagem(path):
     print(" > Limpeza Morfológica do Esqueleto...")
     img_esqueleto_limpo = aplicar_filtros_morfologicos(img_esqueleto)
 
-    # --- NOVO: DIREÇÃO ---
-    # Agora pegamos o MAPA DE ANGULOS (mapa_angulos) também
-    mapa_angulos, vis_dir = estimar_imagem_direcional(img_suave, roi_mask, block_size=16)
+    # Extração de Minúcias (AGORA COM CORTE DE BORDAS)
+    print(" > Extraindo Minúcias (com margem de segurança)...")
+    # margin=15 remove minúcias a 15 pixels da borda da digital
+    img_minucias = extrair_minucias(img_esqueleto_limpo, roi_mask, margin=15)
 
-    # --- NOVO: EXTRAÇÃO E FILTRAGEM ---
-    print(" > Extraindo Minúcias...")
-    # 1. Pega lista bruta (margin=15 evita bordas da ROI)
-    lista_minucias = get_minutiae_list(img_esqueleto_limpo, roi_mask, margin=15)
-    
-    print(" > Filtrando Falsas (Regras I-V)...")
-    # 2. Aplica filtro matemático
-    lista_filtrada = remove_false_minutiae(lista_minucias, img_esqueleto_limpo, mapa_angulos, D=12)
-    
-    # 3. Desenha na imagem
-    esq_bgr = cv2.cvtColor(img_esqueleto_limpo, cv2.COLOR_GRAY2BGR)
-    img_final_minucias = draw_minutiae(esq_bgr, lista_filtrada)
+    # Direção (apenas para visualização)
+    vis_dir = estimar_imagem_direcional(img_suave, roi_mask)
 
-    # --- VISUALIZAÇÃO ---
-    # Passe a nova imagem 'img_final_minucias' para o visualizador
+    # Visualização Completa (2x4)
     visualizar_resultados_plt(
         img_gray, img_fft, roi_mask, img_bin_roi, 
-        img_esqueleto, img_esqueleto_limpo, img_final_minucias, vis_dir
+        img_esqueleto, img_esqueleto_limpo, img_minucias, vis_dir
     )
 
 if __name__ == "__main__":
