@@ -1,13 +1,13 @@
 import cv2
 import os
 import numpy as np 
-import matplotlib.pyplot as plt 
+import math
 
 # --- CONFIGURAÇÃO ---
-ARQUIVO_ALVO = "101_3.tif" 
+ARQUIVO_ALVO = "DB1_B/101_3.tif" 
 
 # ==========================================
-# FUNÇÕES DE PROCESSAMENTO BÁSICO
+# 1. FUNÇÕES DE PRÉ-PROCESSAMENTO
 # ==========================================
 
 def aplicar_fft(img, block_size=32, k=0.45):
@@ -60,7 +60,7 @@ def espalhamento_contraste_local(img, kernel_size=(5, 5)):
     img_saida[mascara_fundo] = 0
     return img_saida
 
-def estimar_roi_variancia(img, block_size=16, threshold_std=20.0):
+def estimar_roi_variancia(img, block_size=16, threshold_std=10.0):
     rows, cols = img.shape
     mask = np.zeros_like(img)
     img_float = img.astype(np.float32)
@@ -78,231 +78,216 @@ def estimar_roi_variancia(img, block_size=16, threshold_std=20.0):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_large)
     
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.erode(mask, kernel_small, iterations=4)
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.erode(mask, kernel_small, iterations=1)
     return mask
-
-def estimar_imagem_direcional(img, roi_mask, block_size=16):
-    rows, cols = img.shape
-    vis_orientacao = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-    
-    for r in range(0, rows, block_size):
-        for c in range(0, cols, block_size):
-            cx, cy = c + block_size // 2, r + block_size // 2
-            if cx < cols and cy < rows:
-                if roi_mask[cy, cx] == 0: continue
-
-            r_end = min(r + block_size, rows)
-            c_end = min(c + block_size, cols)
-            gxb = gx[r:r_end, c:c_end]
-            gyb = gy[r:r_end, c:c_end]
-            val_xy = 2 * np.sum(gxb * gyb)
-            val_xx_yy = np.sum(gxb**2 - gyb**2)
-            
-            if val_xx_yy == 0 and val_xy == 0: angle = 0
-            else: angle = 0.5 * np.arctan2(val_xy, val_xx_yy)
-            
-            length = block_size // 2 - 2
-            x2 = int(cx + length * np.cos(angle + np.pi/2))
-            y2 = int(cy + length * np.sin(angle + np.pi/2))
-            x1 = int(cx - length * np.cos(angle + np.pi/2))
-            y1 = int(cy - length * np.sin(angle + np.pi/2))
-            cv2.line(vis_orientacao, (x1, y1), (x2, y2), (0, 0, 255), 1)
-    return vis_orientacao
 
 def aplicar_afinamento(img_binaria):
     _, img_thresh = cv2.threshold(img_binaria, 127, 255, cv2.THRESH_BINARY)
     try:
-        skeleton = cv2.ximgproc.thinning(img_thresh, thinningType=0) # Zhang-Suen
+        skeleton = cv2.ximgproc.thinning(img_thresh, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
         return skeleton
     except AttributeError:
-        print("[AVISO] cv2.ximgproc não encontrado. Rodando sem afinamento.")
+        print("[AVISO] cv2.ximgproc não encontrado. Instale 'opencv-contrib-python'.")
         return img_thresh
 
-# ==========================================
-# NOVAS FUNÇÕES: LIMPEZA E MINÚCIAS
-# ==========================================
-
 def aplicar_filtros_morfologicos(binary_image):
-    """
-    Remove artefatos do esqueleto (spurs, breaks) usando Hit-Miss.
-    """
-    # Definição dos Kernels para limpeza
-    # 0 -> Deve ser PRETO (Fundo)
-    # 1 -> Deve ser BRANCO (Frente)
     filter_kernels = [
-        # Clean: remove pixel isolado (1 cercado de 0s)
         np.array([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype="int"),
-        # Hbreak vertical
         np.array([[1, 0, 1], [1, 1, 1], [1, 0, 1]], dtype="int"),
-        # Hbreak horizontal
         np.array([[1, 1, 1], [0, 1, 0], [1, 1, 1]], dtype="int")
     ]
-
-    # Spurs (Espinhos)
-    spur1 = np.array([[0,0,0,0,0], [-1,-1,-1,-1,0], [-1,-1,1,-1,0], [-1,1,-1,-1,0], [1,1,-1,-1,0]], dtype="int")
-    spur2 = np.array([[0,0,0,0,0], [-1,-1,-1,-1,0], [-1,-1,1,-1,0], [1,1,-1,-1,0], [1,-1,-1,-1,0]], dtype="int")
-    
-    spur_filter_kernels = []
-    for _ in range(4):
-        spur1 = np.rot90(spur1); spur_filter_kernels.append(spur1)
-        spur2 = np.rot90(spur2); spur_filter_kernels.append(spur2)
-
     result_image = binary_image.copy()
-
-    # Aplica filtros básicos
     for kernel in filter_kernels:
-        # Prepara kernel para Hit-Miss: 1=FG, -1=BG
         k = np.where(kernel == 0, -1, kernel) 
-        # Aumenta um pouco a borda para garantir que funcione
-        match_map = cv2.morphologyEx(result_image, cv2.MORPH_HITMISS, k)
-        # Remove pixels que deram match
-        result_image[match_map > 0] = 0
-
-    # Aplica filtros de Spurs
-    for kernel in spur_filter_kernels:
-        # A lógica do seu colega usava -1 explicitamente nos spurs
-        # Vamos manter a lógica dele de conversão para garantir compatibilidade
-        # Nota: Se o kernel já tem -1, o np.where vai mantê-lo. Se tem 0, vira -1.
-        k = np.where(kernel == 0, -1, kernel)
         match_map = cv2.morphologyEx(result_image, cv2.MORPH_HITMISS, k)
         result_image[match_map > 0] = 0
-
     return result_image
 
-def extrair_minucias(skeleton_image, roi_mask, margin=10):
-    """
-    Encontra bifurcações e terminações, IGNORANDO as bordas da ROI.
-    margin: distância em pixels da borda para ignorar (evita falsas terminações).
-    """
-    # 1. Cria uma "Zona Segura" para ignorar as bordas
-    # Erode a ROI pela margem especificada. Tudo fora disso é ignorado.
-    kernel_margin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin*2, margin*2))
-    zona_segura = cv2.erode(roi_mask, kernel_margin)
-    
-    # Bifurcação: pixel central conectado a 3 vizinhos
-    bifurcation_kernels_base = [
-        np.array([[1, 0, 1], [0, 1, 0], [0, 1, 0]], dtype="int"), # T
-        np.array([[0, 1, 0], [1, 1, 0], [0, 0, 1]], dtype="int")  # Y
-    ]
-    
-    # Terminação: pixel central conectado a apenas 1 vizinho
-    termination_kernels_base = [
-        np.array([[0, 1, 0], [0, 1, 0], [0, 0, 0]], dtype="int"),
-        np.array([[1, 0, 0], [0, 1, 0], [0, 0, 0]], dtype="int")
-    ]
-
-    # Gera rotações
-    bifurcation_kernels = []
-    for k in bifurcation_kernels_base:
-        for _ in range(4): k = np.rot90(k); bifurcation_kernels.append(k)
-
-    termination_kernels = []
-    for k in termination_kernels_base:
-        for _ in range(4): k = np.rot90(k); termination_kernels.append(k)
-
-    # Imagem para desenho (BGR)
-    minutiae_map = cv2.cvtColor(skeleton_image, cv2.COLOR_GRAY2BGR)
-    
-    # Detecta Bifurcações (Vermelho)
-    for kernel in bifurcation_kernels:
-        k = np.where(kernel == 0, -1, kernel)
-        matches = cv2.morphologyEx(skeleton_image, cv2.MORPH_HITMISS, k)
-        
-        # Filtra pela Zona Segura
-        matches = cv2.bitwise_and(matches, matches, mask=zona_segura)
-        
-        # Dilata para visualização
-        matches_vis = cv2.dilate(matches, np.ones((3,3), np.uint8)) 
-        minutiae_map[matches_vis > 0] = [0, 0, 255] # Red
-
-    # Detecta Terminações (Verde)
-    for kernel in termination_kernels:
-        k = np.where(kernel == 0, -1, kernel)
-        matches = cv2.morphologyEx(skeleton_image, cv2.MORPH_HITMISS, k)
-        
-        # Filtra pela Zona Segura (AQUI É O TRUQUE DO CORTE)
-        matches = cv2.bitwise_and(matches, matches, mask=zona_segura)
-        
-        matches_vis = cv2.dilate(matches, np.ones((3,3), np.uint8))
-        minutiae_map[matches_vis > 0] = [0, 255, 0] # Green
-
-    return minutiae_map
-
 # ==========================================
-# VISUALIZAÇÃO E MAIN
+# 2. EXTRAÇÃO E PÓS-PROCESSAMENTO
 # ==========================================
 
-def visualizar_resultados_plt(orig, fft, roi, binaria, esq_bruto, esq_limpo, minucias, direcional):
-    plt.figure(figsize=(16, 8))
+def compute_crossing_number(skeleton):
+    rows, cols = skeleton.shape
+    padded = np.pad(skeleton, 1, mode='constant')
+    minutiae_list = []
+    skel_bool = (padded > 0).astype(int)
+
+    idx = [(-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            if skel_bool[r, c] == 1:
+                cn_val = 0
+                for i in range(8):
+                    val_curr = skel_bool[r + idx[i][0], c + idx[i][1]]
+                    val_next = skel_bool[r + idx[i+1][0], c + idx[i+1][1]]
+                    cn_val += abs(val_curr - val_next)
+                cn_val = cn_val // 2
+
+                if cn_val == 1:
+                    minutiae_list.append({'x': c-1, 'y': r-1, 'type': 'Terminacao'})
+                elif cn_val == 3:
+                    minutiae_list.append({'x': c-1, 'y': r-1, 'type': 'Bifurcacao'})
+    return minutiae_list
+
+def filtrar_minucias(minutiae_list, roi_mask, distance_thresh=10):
+    valid_minutiae = []
     
-    # Lista de 8 imagens para grid 2x4
-    data = [
-        (orig, "1. Original Inv.", 'gray'),
-        (fft, "2. FFT/Suave", 'gray'),
-        (roi, "3. ROI", 'gray'),
-        (binaria, "4. Binária", 'gray'),
-        (esq_bruto, "5. Esqueleto Bruto", 'gray'),
-        (esq_limpo, "6. Esqueleto Limpo", 'gray'),
-        (minucias, "7. Minúcias (V=Fim, Vm=Bif)", None),
-        (cv2.cvtColor(direcional, cv2.COLOR_BGR2RGB), "8. Direção", None)
-    ]
+    # 1. Filtro de ROI Segura
+    kernel_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
+    roi_safe = cv2.erode(roi_mask, kernel_safe)
+
+    temp_list = []
+    for m in minutiae_list:
+        if 0 <= m['y'] < roi_safe.shape[0] and 0 <= m['x'] < roi_safe.shape[1]:
+            if roi_safe[m['y'], m['x']] > 0:
+                temp_list.append(m)
     
-    for i, (img, title, cmap) in enumerate(data):
-        plt.subplot(2, 4, i+1)
-        plt.imshow(img, cmap=cmap)
-        plt.title(title)
-        plt.axis('off')
+    # 2. Filtro de Distância Euclidiana
+    ignore_indices = set()
+    for i in range(len(temp_list)):
+        if i in ignore_indices: continue
+        m1 = temp_list[i]
+        for j in range(i + 1, len(temp_list)):
+            if j in ignore_indices: continue
+            m2 = temp_list[j]
+            dist = math.sqrt((m1['x'] - m2['x'])**2 + (m1['y'] - m2['y'])**2)
+            if dist < distance_thresh:
+                ignore_indices.add(i)
+                ignore_indices.add(j)
     
-    plt.tight_layout()
-    plt.show()
+    for i in range(len(temp_list)):
+        if i not in ignore_indices:
+            valid_minutiae.append(temp_list[i])
+
+    return valid_minutiae
+
+def desenhar_minucias(img_rgb, minutiae_list):
+    vis = img_rgb.copy()
+    for m in minutiae_list:
+        # BGR: Verde=(0,255,0), Vermelho=(0,0,255)
+        color = (0, 255, 0) if m['type'] == 'Terminacao' else (0, 0, 255)
+        cv2.circle(vis, (m['x'], m['y']), 4, color, 1)
+        if m['type'] == 'Bifurcacao':
+            cv2.rectangle(vis, (m['x']-3, m['y']-3), (m['x']+3, m['y']+3), color, 1)
+    return vis
+
+# ==========================================
+# 3. VISUALIZAÇÃO COM HCONCAT (3 em 3)
+# ==========================================
+
+def mostrar_imagens_agrupadas(etapas_dict):
+    """
+    Agrupa imagens de 3 em 3 e exibe em janelas unificadas.
+    """
+    print("\n--- Visualização ---")
+    print("Pressione qualquer tecla para encerrar.")
+    
+    # Lista auxiliar para processar
+    chaves = list(etapas_dict.keys())
+    imgs_processadas = []
+
+    # Prepara todas as imagens (converte para BGR e adiciona texto)
+    for titulo in chaves:
+        img = etapas_dict[titulo]
+        
+        # Converte grayscale para BGR para poder concatenar com as coloridas
+        if len(img.shape) == 2:
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img_bgr = img.copy()
+            
+        # Adiciona o título na própria imagem (canto superior esquerdo)
+        # Fundo preto no texto para legibilidade
+        cv2.rectangle(img_bgr, (0,0), (img_bgr.shape[1], 40), (0,0,0), -1)
+        cv2.putText(img_bgr, titulo, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        imgs_processadas.append(img_bgr)
+
+    # Loop para criar os painéis de 3 em 3
+    grupo_id = 1
+    for i in range(0, len(imgs_processadas), 3):
+        # Pega fatia de 3 imagens
+        batch = imgs_processadas[i : i+3]
+        
+        # Se for o último e não tiver 3, o hconcat funciona igual (concatena o que tiver)
+        if len(batch) > 0:
+            painel = cv2.hconcat(batch)
+            
+            nome_janela = f"Painel {grupo_id} (Imagens {i+1}-{i+len(batch)})"
+            cv2.imshow(nome_janela, painel)
+            
+            # Posiciona janelas em cascata para não sobrepor totalmente
+            cv2.moveWindow(nome_janela, 50 + (grupo_id-1)*40, 50 + (grupo_id-1)*40)
+            grupo_id += 1
+
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 def processar_imagem(path):
-    print(f"Lendo imagem: {path}")
+    print(f"Lendo: {path}")
     img_bgr = cv2.imread(path)
-    if img_bgr is None: 
-        print("ERRO: Imagem não encontrada.")
-        return
+    if img_bgr is None: print("Erro arquivo."); return
 
-    # Pipeline de Pré-processamento
+    etapas = {}
+
+    # 1. Leitura
     img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    if np.mean(img_gray) > 127: # Inversão se fundo branco
-        img_gray = 255 - img_gray
+    if np.mean(img_gray) > 127: img_gray = 255 - img_gray
+    etapas["1. Original"] = img_gray
 
+    # 2. Pré-processamento
     img_eq = cv2.equalizeHist(img_gray)
     img_limpa = espalhamento_contraste_local(img_eq)
+    etapas["2. Contraste"] = img_limpa
+
     img_fft = aplicar_fft(img_limpa, k=0.45)
-    img_suave = aplicar_suavizacao(img_fft)
+    etapas["3. FFT"] = img_fft
     
-    # Binarização e ROI
-    print(" > Binarizando e calculando ROI...")
-    roi_mask = estimar_roi_variancia(img_suave, threshold_std=7.0)
+    img_suave = aplicar_suavizacao(img_fft)
+    etapas["4. Suavizacao"] = img_suave
+
+    # 3. ROI e Binarização
+    roi_mask = estimar_roi_variancia(img_suave, threshold_std=10.0) 
+    etapas["5. ROI Mask"] = roi_mask
+
     img_bin = binarizar_otsu_local(img_suave)
     img_bin_roi = cv2.bitwise_and(img_bin, img_bin, mask=roi_mask)
+    etapas["6. Binaria+ROI"] = img_bin_roi
 
-    # Afinamento (Esqueleto)
-    print(" > Afinamento (Zhang-Suen)...")
+    # 4. Esqueleto
     img_esqueleto = aplicar_afinamento(img_bin_roi)
+    etapas["7. Esqueleto"] = img_esqueleto
 
-    # Limpeza Morfológica (NOVO)
-    print(" > Limpeza Morfológica do Esqueleto...")
     img_esqueleto_limpo = aplicar_filtros_morfologicos(img_esqueleto)
+    etapas["8. Esq. Limpo"] = img_esqueleto_limpo
 
-    # Extração de Minúcias (AGORA COM CORTE DE BORDAS)
-    print(" > Extraindo Minúcias (com margem de segurança)...")
-    # margin=15 remove minúcias a 15 pixels da borda da digital
-    img_minucias = extrair_minucias(img_esqueleto_limpo, roi_mask, margin=15)
+    # 5. Extração e Filtragem
+    lista_bruta = compute_crossing_number(img_esqueleto_limpo)
+    
+    # Desenho das brutas
+    esq_bgr_bruto = cv2.cvtColor(img_esqueleto_limpo, cv2.COLOR_GRAY2BGR)
+    vis_bruta = desenhar_minucias(esq_bgr_bruto, lista_bruta)
+    etapas["9. Minucias Brutas"] = vis_bruta
 
-    # Direção (apenas para visualização)
-    vis_dir = estimar_imagem_direcional(img_suave, roi_mask)
+    # Filtragem
+    lista_filtrada = filtrar_minucias(lista_bruta, roi_mask, distance_thresh=10)
+    print(f"Minúcias Finais: {len(lista_filtrada)}")
+    
+    # Desenho final
+    esq_bgr_final = cv2.cvtColor(img_esqueleto_limpo, cv2.COLOR_GRAY2BGR)
+    vis_final = desenhar_minucias(esq_bgr_final, lista_filtrada)
+    etapas["10. Minucias Finais"] = vis_final
 
-    # Visualização Completa (2x4)
-    visualizar_resultados_plt(
-        img_gray, img_fft, roi_mask, img_bin_roi, 
-        img_esqueleto, img_esqueleto_limpo, img_minucias, vis_dir
-    )
+    # Resultado sobreposto na original
+    overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    overlay = desenhar_minucias(overlay, lista_filtrada)
+    etapas["11. Overlay Final"] = overlay
+
+    # Exibe agrupado
+    mostrar_imagens_agrupadas(etapas)
 
 if __name__ == "__main__":
     if os.path.exists(ARQUIVO_ALVO):
